@@ -1,0 +1,631 @@
+##############################################
+# LOAD PACKAGES
+##############################################
+install.packages(c(
+  "dplyr", "ggplot2", "tidyr", "viridis", "sf",
+  "rnaturalearth", "rnaturalearthdata", "reshape2",
+  "signal", "ggthemes"
+))
+
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(viridis)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(reshape2)
+library(signal)
+library(ggthemes)
+
+##############################################
+# CLEANING EM-DAT
+##############################################
+
+# Uppercase ISO
+em_dat$ISO <- toupper(em_dat$ISO)
+
+# Numeric clean
+em_dat <- em_dat %>%
+  mutate(
+    Total_Damage      = ifelse(is.na(`Total Damage ('000 US$)`), 0, `Total Damage ('000 US$)`),
+    Total_Damage_Adj  = ifelse(is.na(`Total Damage, Adjusted ('000 US$)`), 0, `Total Damage, Adjusted ('000 US$)`),
+    Deaths            = ifelse(is.na(`Total Deaths`), 0, `Total Deaths`),
+    `Start Year`      = as.numeric(`Start Year`)
+  )
+
+# Use dplyr::filter to avoid conflicts with signal::filter
+em_dat <- em_dat %>%
+  dplyr::filter(`Disaster Subgroup` %in% c("Climatological",
+                                        "Hydrological",
+                                        "Meteorological"))
+
+# Harmonize ISO codes
+em_dat$ISO <- toupper(em_dat$ISO)
+
+
+##############################################
+# LOAD WORLD MAP (FIX rename ERROR)
+##############################################
+world <- ne_countries(scale = "medium", returnclass = "sf")
+world$ISO <- world$iso_a3   # assign manually, avoids rename.sf() error
+
+##############################################
+# GEOGRAPHICAL AGGREGATION
+##############################################
+geo_stats <- em_dat %>%
+  group_by(ISO) %>%
+  summarise(
+    Events = n(),
+    Deaths = sum(Deaths, na.rm = TRUE),
+    Damage = sum(Total_Damage_Adj, na.rm = TRUE)
+  )
+
+world <- left_join(world, geo_stats, by = "ISO") %>%
+  mutate(across(c(Events, Deaths, Damage), ~ tidyr::replace_na(., 0)))
+
+##############################################
+# GEOMAPPING FUNCTION
+##############################################
+plot_map <- function(column, title) {
+  ggplot(world) +
+    geom_sf(aes_string(fill = column), color = NA) +
+    scale_fill_viridis(option = "C", direction = -1) +
+    theme_void() +
+    ggtitle(title)
+}
+
+##############################################
+# PLOT WORLD MAPS
+##############################################
+plot_map("Events", "Global Count of EM-DAT Events")
+plot_map("Deaths", "Total Deaths by Country")
+plot_map("Damage", "Economic Damage (Adjusted, kUSD)")
+
+
+plot_map <- function(column, title, log_scale = FALSE) {
+  
+  data_to_plot <- world
+  
+  # log transformation (safe)
+  if (log_scale) {
+    data_to_plot[[column]] <- log10(data_to_plot[[column]] + 1)
+  }
+  
+  ggplot(data_to_plot) +
+    geom_sf(aes_string(fill = column), color = NA) +
+    
+    # 🌍 palette académique propre (World Bank style)
+    scale_fill_distiller(
+      palette = "Blues",
+      direction = 1,
+      na.value = "grey90"
+    ) +
+    
+    theme_void() +
+    ggtitle(title)
+}
+
+##############################################
+# LOG-SCALE MAPS
+##############################################
+
+plot_map("Events", "Global Count of EM-DAT Events (log10)", log_scale = TRUE)
+plot_map("Deaths", "Total Deaths by Country (log10)", log_scale = TRUE)
+plot_map("Damage", "Economic Damage (Adjusted, kUSD, log10)", log_scale = TRUE)
+
+
+##############################################
+# FREQUENCY OF DISASTERS
+##############################################
+ggplot(em_dat, aes(x = `Disaster Type`)) +
+  geom_bar(fill = "steelblue") +
+  theme_minimal() +
+  coord_flip() +
+  ggtitle("Frequency by Disaster Type")
+
+##############################################
+# DEATHS BY DISASTER TYPE
+##############################################
+em_dat %>%
+  group_by(`Disaster Type`) %>%
+  summarise(Total_Deaths = sum(Deaths)) %>%
+  ggplot(aes(x = reorder(`Disaster Type`, Total_Deaths), y = Total_Deaths)) +
+  geom_col(fill = "darkred") +
+  coord_flip() +
+  ggtitle("Deaths by Disaster Type")
+
+##############################################
+# DAMAGE BY DISASTER TYPE
+##############################################
+em_dat %>%
+  group_by(`Disaster Type`) %>%
+  summarise(Total_Damage = sum(Total_Damage_Adj)) %>%
+  ggplot(aes(x = reorder(`Disaster Type`, Total_Damage), y = Total_Damage)) +
+  geom_col(fill = "purple") +
+  coord_flip() +
+  ggtitle("Economic Damage (Adjusted) by Disaster Type")
+
+
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# 1) Remove year 2025 and rows with missing Start Year
+em_dat_filtered <- em_dat %>%
+  dplyr::filter(!is.na(`Start Year`), `Start Year` != 2025)
+
+# 2) Build one combined time-series dataframe
+ts_all <- em_dat_filtered %>%
+  group_by(`Start Year`) %>%
+  summarise(
+    Events = n(),
+    Deaths = sum(Deaths, na.rm = TRUE),
+    Damage = sum(Total_Damage_Adj, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(
+    cols = c(Events, Deaths, Damage),
+    names_to = "Series",
+    values_to = "Value"
+  )
+
+# 3) Plot the three series in the same figure (stacked panels)
+ggplot(ts_all, aes(x = `Start Year`, y = Value)) +
+  geom_line() +
+  facet_wrap(~ Series, ncol = 1, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    title = "Time Series of Climate-Related Impacts (excluding 2025)",
+    x = "Year",
+    y = NULL
+  )
+
+
+##############################################
+# FFT SPECTRAL ANALYSIS
+##############################################
+events_ts <- ts(ts_events$n, frequency = 1)
+fft_values <- abs(fft(events_ts - mean(events_ts)))
+freq_axis <- seq(0, length(fft_values)-1) / length(fft_values)
+
+plot(freq_axis[1:floor(length(freq_axis)/2)],
+     fft_values[1:floor(length(fft_values)/2)],
+     type="l", col="blue",
+     xlab="Frequency", ylab="Amplitude",
+     main="FFT Spectrum of Disaster Frequency")
+
+
+##############################################
+# 1. BASIC CLEANING (ISO + numeric fields)
+##############################################
+
+# Uppercase ISO
+em_dat$ISO <- toupper(em_dat$ISO)
+
+# Clean numerical variables
+em_dat <- em_dat %>%
+  mutate(
+    Total_Damage      = ifelse(is.na(`Total Damage ('000 US$)`), 0, `Total Damage ('000 US$)`),
+    Total_Damage_Adj  = ifelse(is.na(`Total Damage, Adjusted ('000 US$)`), 0, `Total Damage, Adjusted ('000 US$)`),
+    Deaths            = ifelse(is.na(`Total Deaths`), 0, `Total Deaths`),
+    `Start Year`      = as.numeric(`Start Year`)
+  )
+
+
+##############################################
+# 2. ----------- GLOBAL DAMAGE STATISTICS ----------
+##############################################
+
+### Total global economic damage
+total_global_damage <- sum(em_dat$Total_Damage_Adj, na.rm = TRUE)
+
+### Total global deaths
+total_global_deaths <- sum(em_dat$Deaths, na.rm = TRUE)
+
+### Total number of climate-related events
+total_global_events <- nrow(em_dat)
+
+
+##############################################
+# 3. ----------- DAMAGE BY REGION ----------
+##############################################
+
+damage_by_region <- em_dat %>%
+  group_by(Region) %>%
+  summarise(
+    Damage = sum(Total_Damage_Adj, na.rm = TRUE)
+  ) %>%
+  mutate(
+    Share = Damage / sum(Damage) * 100
+  ) %>%
+  arrange(desc(Share))
+
+
+##############################################
+# 4. ----------- DEATHS BY COUNTRY ----------
+##############################################
+
+deaths_by_country <- em_dat %>%
+  group_by(Country) %>%
+  summarise(Deaths = sum(Deaths, na.rm = TRUE)) %>%
+  mutate(Share = Deaths / sum(Deaths) * 100) %>%
+  arrange(desc(Share))
+
+### Share of top 10 countries in global deaths
+top10_deaths_share <- deaths_by_country %>%
+  slice(1:10) %>%
+  summarise(Share = sum(Share)) %>%
+  pull(Share)
+
+
+##############################################
+# 5. ----------- EVENTS BY REGION ----------
+##############################################
+
+events_by_region <- em_dat %>%
+  group_by(Region) %>%
+  summarise(Events = n()) %>%
+  mutate(Share = Events / sum(Events) * 100) %>%
+  arrange(desc(Share))
+
+
+##############################################
+# 6. ----------- DAMAGE BY COUNTRY ----------
+##############################################
+
+damage_by_country <- em_dat %>%
+  group_by(Country) %>%
+  summarise(Damage = sum(Total_Damage_Adj, na.rm = TRUE)) %>%
+  mutate(Share = Damage / sum(Damage) * 100) %>%
+  arrange(desc(Share))
+
+### Share of top 5 countries in global damage
+top5_damage_share <- damage_by_country %>%
+  slice(1:5) %>%
+  summarise(Share = sum(Share)) %>%
+  pull(Share)
+
+
+##############################################
+# 7. ----------- GINI COEFFICIENTS ----------
+##############################################
+
+library(ineq)
+
+gini_damage <- ineq(damage_by_country$Damage, type = "Gini")
+gini_deaths <- ineq(deaths_by_country$Deaths, type = "Gini")
+
+
+##############################################
+# 8. ----------- SUMMARY OBJECT FOR EXPORT ----------
+##############################################
+
+summary_stats <- list(
+  total_global_damage = total_global_damage,
+  total_global_deaths = total_global_deaths,
+  total_global_events = total_global_events,
+  damage_by_region = damage_by_region,
+  deaths_by_country_top10 = deaths_by_country %>% slice(1:10),
+  top10_deaths_share = top10_deaths_share,
+  events_by_region = events_by_region,
+  damage_by_country_top10 = damage_by_country %>% slice(1:10),
+  top5_damage_share = top5_damage_share,
+  gini_damage = gini_damage,
+  gini_deaths = gini_deaths
+)
+
+summary_stats
+
+
+
+
+
+
+
+############################################################
+# STATS FOR: FREQUENCY, DEATHS, AND DAMAGES BY DISASTER TYPE
+############################################################
+
+# Ensure disaster type has no missing values
+em_dat$`Disaster Type` <- ifelse(em_dat$`Disaster Type` == "" | 
+                                   is.na(em_dat$`Disaster Type`),
+                                 "Unknown", 
+                                 em_dat$`Disaster Type`)
+
+###############################
+# 1. FREQUENCY BY DISASTER TYPE
+###############################
+freq_by_type <- em_dat %>%
+  group_by(`Disaster Type`) %>%
+  summarise(Events = n()) %>%
+  mutate(Share = Events / sum(Events) * 100) %>%
+  arrange(desc(Events))
+
+###############################
+# 2. DEATHS BY DISASTER TYPE
+###############################
+deaths_by_type <- em_dat %>%
+  group_by(`Disaster Type`) %>%
+  summarise(Total_Deaths = sum(Deaths, na.rm = TRUE)) %>%
+  mutate(Share = Total_Deaths / sum(Total_Deaths) * 100) %>%
+  arrange(desc(Total_Deaths))
+
+###############################
+# 3. ECONOMIC DAMAGE BY DISASTER TYPE
+###############################
+damage_by_type <- em_dat %>%
+  group_by(`Disaster Type`) %>%
+  summarise(Total_Damage = sum(Total_Damage_Adj, na.rm = TRUE)) %>%
+  mutate(Share = Total_Damage / sum(Total_Damage) * 100) %>%
+  arrange(desc(Total_Damage))
+
+###############################
+# 4. TOP CONTRIBUTORS
+###############################
+top3_freq <- freq_by_type %>% slice(1:3)
+top3_deaths <- deaths_by_type %>% slice(1:3)
+top3_damage <- damage_by_type %>% slice(1:3)
+
+###############################
+# 5. GINI INEQUALITY BY TYPE (damage & deaths)
+###############################
+library(ineq)
+
+gini_damage_type <- ineq(damage_by_type$Total_Damage, type = "Gini")
+gini_deaths_type <- ineq(deaths_by_type$Total_Deaths, type = "Gini")
+
+###############################
+# 6. OUTPUT LIST
+###############################
+stats_disaster_type <- list(
+  freq_by_type = freq_by_type,
+  deaths_by_type = deaths_by_type,
+  damage_by_type = damage_by_type,
+  top3_freq = top3_freq,
+  top3_deaths = top3_deaths,
+  top3_damage = top3_damage,
+  gini_damage_type = gini_damage_type,
+  gini_deaths_type = gini_deaths_type
+)
+
+stats_disaster_type
+
+
+
+
+
+
+##############################################
+# TIME SERIES STATISTICS
+##############################################
+
+# 1) Remove 2025 and missing years
+em_dat_filtered <- em_dat %>%
+  dplyr::filter(!is.na(`Start Year`), `Start Year` != 2025)
+
+# 2) Aggregate time series
+ts_summary <- em_dat_filtered %>%
+  group_by(`Start Year`) %>%
+  summarise(
+    Events = n(),
+    Deaths = sum(Deaths, na.rm = TRUE),
+    Damage = sum(Total_Damage_Adj, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+############################################################
+# 3) Compute descriptive statistics for the three time series
+############################################################
+
+library(moments)   # for skewness, kurtosis
+
+time_series_stats <- list(
+  
+  events_stats = ts_summary %>%
+    summarise(
+      mean = mean(Events),
+      median = median(Events),
+      sd = sd(Events),
+      min = min(Events),
+      max = max(Events),
+      skewness = skewness(Events),
+      kurtosis = kurtosis(Events),
+      total_events = sum(Events)
+    ),
+  
+  deaths_stats = ts_summary %>%
+    summarise(
+      mean = mean(Deaths),
+      median = median(Deaths),
+      sd = sd(Deaths),
+      min = min(Deaths),
+      max = max(Deaths),
+      skewness = skewness(Deaths),
+      kurtosis = kurtosis(Deaths),
+      total_deaths = sum(Deaths)
+    ),
+  
+  damage_stats = ts_summary %>%
+    summarise(
+      mean = mean(Damage),
+      median = median(Damage),
+      sd = sd(Damage),
+      min = min(Damage),
+      max = max(Damage),
+      skewness = skewness(Damage),
+      kurtosis = kurtosis(Damage),
+      total_damage = sum(Damage)
+    )
+)
+
+############################################################
+# 4) Optional: compute linear trend (slope) for each series
+############################################################
+
+events_trend <- lm(Events ~ `Start Year`, data = ts_summary)
+deaths_trend <- lm(Deaths ~ `Start Year`, data = ts_summary)
+damage_trend <- lm(Damage ~ `Start Year`, data = ts_summary)
+
+trend_statistics <- list(
+  events_slope = coef(events_trend)[2],
+  deaths_slope = coef(deaths_trend)[2],
+  damage_slope = coef(damage_trend)[2]
+)
+
+############################################################
+# 5) Output all stats
+############################################################
+
+time_series_results <- list(
+  descriptive_stats = time_series_stats,
+  trend_stats = trend_statistics
+)
+
+time_series_results
+
+
+
+
+
+
+##############################################
+# FFT SPECTRAL ANALYSIS — STATISTICS
+##############################################
+
+# Build the time series (remove NA and 2025 if needed)
+ts_events <- ts(ts_events$n, frequency = 1)
+
+# Detrend / center
+events_centered <- ts_events - mean(ts_events)
+
+# FFT
+fft_values <- fft(events_centered)
+fft_amp <- Mod(fft_values)
+
+# Frequency axis
+freq_axis <- seq(0, length(fft_amp)-1) / length(fft_amp)
+
+# Keep only positive frequencies
+half <- floor(length(freq_axis)/2)
+
+fft_df <- data.frame(
+  frequency = freq_axis[1:half],
+  amplitude = fft_amp[1:half]
+)
+
+# Identify dominant cycle (peak frequency)
+dominant_freq <- fft_df$frequency[which.max(fft_df$amplitude)]
+dominant_period <- ifelse(dominant_freq > 0, 1 / dominant_freq, NA)
+
+# Compute spectral concentration metrics
+spectral_stats <- list(
+  max_amplitude = max(fft_df$amplitude),
+  dominant_frequency = dominant_freq,
+  dominant_period_years = dominant_period,
+  total_power = sum(fft_df$amplitude^2),
+  top_3_frequencies = fft_df %>% top_n(3, amplitude)
+)
+
+spectral_stats
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+
+# Ensure damage variable exists and is numeric
+em_dat$Damage <- em_dat$Total_Damage_Adj
+
+# Remove zeros FOR EVT using dplyr::filter explicitly
+damage_pos <- em_dat %>% dplyr::filter(Damage > 0)
+
+##############################################
+# 1) Histogram (log scale on x-axis)
+##############################################
+ggplot(damage_pos, aes(x = Damage)) +
+  geom_histogram(bins = 80, fill = "steelblue", alpha = 0.8) +
+  scale_x_log10(labels = scales::comma) +
+  theme_minimal() +
+  labs(
+    title = "Distribution of Disaster Damages (log scale)",
+    x = "Damage (Adjusted USD, log scale)",
+    y = "Count"
+  )
+
+##############################################
+# 2) Kernel Density of log-damages
+##############################################
+ggplot(damage_pos, aes(x = log(Damage))) +
+  geom_density(fill = "darkred", alpha = 0.6) +
+  theme_minimal() +
+  labs(
+    title = "Density of log(Damage)",
+    x = "log(Damage)",
+    y = "Density"
+  )
+
+##############################################
+# 3) Log–Log Survival Function
+##############################################
+surv_df <- damage_pos %>%
+  arrange(Damage) %>%
+  mutate(
+    rank = row_number(),
+    survival = 1 - rank / n()
+  )
+
+ggplot(surv_df, aes(x = Damage, y = survival)) +
+  geom_point(alpha = 0.4, color = "purple") +
+  scale_x_log10(labels = scales::comma) +
+  scale_y_log10() +
+  theme_minimal() +
+  labs(
+    title = "Log–Log Survival Plot of Damages",
+    x = "Damage (Adjusted USD, log scale)",
+    y = "Survival P(Damage > x)"
+  )
+
+
+
+
+
+# Hill estimator (very basic)
+library(evir)
+
+hill_estimate <- hill(damage_pos$Damage)
+hill_estimate
+
+
+
+damage_summary_stats <- damage_pos %>%
+  summarise(
+    n = n(),
+    min = min(Damage),
+    q25 = quantile(Damage, 0.25),
+    median = median(Damage),
+    mean = mean(Damage),
+    q75 = quantile(Damage, 0.75),
+    q90 = quantile(Damage, 0.90),
+    q95 = quantile(Damage, 0.95),
+    q99 = quantile(Damage, 0.99),
+    max = max(Damage),
+    sd = sd(Damage)
+  )
+
+damage_summary_stats
+
+
