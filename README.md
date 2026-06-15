@@ -133,9 +133,7 @@ The repository allows reproduction of:
 * all contagion simulations;
 * all climate stress-test results;
 * all figures and tables included in the thesis.
-
-Input datasets were collected and pre-processed manually. Consequently, raw datasets are not necessarily included in this repository and may require separate access requests to their respective providers.
-
+  
 ---
 
 # Main Data Sources
