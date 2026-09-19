@@ -1,0 +1,888 @@
+packageVersion("rlang")
+install.packages("rlang")
+.rs.restartR()
+
+
+assets <- data_ENGIE
+
+
+library(dplyr)
+
+
+assets_clean <- data_ENGIE %>%
+  mutate(
+    asset_id = row_number(),
+    Latitude = as.numeric(gsub(",", ".", Latitude)),
+    Longitude = as.numeric(gsub(",", ".", Longitude)),
+    capacity_mw = as.numeric(gsub(",", ".", `Capacity (MW)`))
+  ) %>%
+  filter(
+    !is.na(Latitude),
+    !is.na(Longitude),
+    Latitude >= -90,
+    Latitude <= 90,
+    Longitude >= -180,
+    Longitude <= 180
+  )
+
+
+assets_unique <- assets_clean %>%
+  group_by(Longitude, Latitude, `Country/area`, Type...9) %>%
+  summarise(
+    capacity_mw = sum(capacity_mw, na.rm = TRUE),
+    n_units = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(asset_point_id = row_number())
+
+
+dim(assets_clean)
+
+summary(assets_clean[,c("Latitude","Longitude","capacity_mw")])
+
+head(assets_clean)
+
+
+assets_unique <- assets_clean %>%
+  group_by(Longitude, Latitude, `Country/area`, Type...9) %>%
+  summarise(
+    capacity_mw = sum(capacity_mw, na.rm = TRUE),
+    n_units = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(asset_point_id = row_number())
+
+nrow(assets_unique)
+head(assets_unique)
+
+write.csv(
+  assets_unique,
+  "C:/Users/sguichoud/Desktop/PD Risques Physiques appliquée/data/assets_unique_ENGIE.csv",
+  row.names = FALSE
+)
+
+
+
+
+
+nrow(assets_unique)
+install.packages(c(
+  "terra",
+  "dplyr",
+  "tidyr",
+  "readr"
+))
+
+library(terra)
+library(dplyr)
+library(tidyr)
+library(readr)
+
+
+
+
+# ============================================================
+# World Bank CCKP - RX5day automatic download and extraction
+# Historical + SSP126 + SSP245 + SSP370 + SSP585 until 2050
+# ============================================================
+
+library(terra)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(httr2)
+library(xml2)
+library(readr)
+
+# ------------------------------------------------------------
+# 1. Parameters
+# ------------------------------------------------------------
+
+bucket_url <- "https://wbg-cckp.s3.amazonaws.com"
+
+collection <- "cmip6-x0.25"
+variable <- "rx5day"
+
+scenarios <- c(
+  "historical",
+  "ssp126",
+  "ssp245",
+  "ssp370",
+  "ssp585"
+)
+
+years_keep <- 1950:2050
+
+dir.create("data_raw/cckp_rx5day", recursive = TRUE, showWarnings = FALSE)
+dir.create("data_processed", recursive = TRUE, showWarnings = FALSE)
+
+# ------------------------------------------------------------
+# 2. Function to list files from public CCKP bucket
+# ------------------------------------------------------------
+
+list_s3_keys <- function(prefix) {
+  
+  keys <- c()
+  continuation_token <- NULL
+  
+  repeat {
+    
+    url <- paste0(
+      bucket_url,
+      "/?list-type=2&prefix=",
+      URLencode(prefix, reserved = TRUE)
+    )
+    
+    if (!is.null(continuation_token)) {
+      url <- paste0(
+        url,
+        "&continuation-token=",
+        URLencode(continuation_token, reserved = TRUE)
+      )
+    }
+    
+    resp <- request(url) %>% req_perform()
+    xml <- resp_body_xml(resp)
+    
+    new_keys <- xml_find_all(xml, "//*[local-name()='Key']") %>%
+      xml_text()
+    
+    keys <- c(keys, new_keys)
+    
+    is_truncated <- xml_find_first(
+      xml,
+      "//*[local-name()='IsTruncated']"
+    ) %>%
+      xml_text()
+    
+    if (length(is_truncated) == 0 ||
+        is.na(is_truncated) ||
+        is_truncated != "true") {
+      break
+    }
+    
+    continuation_token <- xml_find_first(
+      xml,
+      "//*[local-name()='NextContinuationToken']"
+    ) %>%
+      xml_text()
+  }
+  
+  keys
+}
+
+# ------------------------------------------------------------
+# 3. Test bucket access
+# ------------------------------------------------------------
+
+test_keys <- list_s3_keys("data/cmip6-x0.25/rx5day/")
+
+if (length(test_keys) == 0) {
+  stop("No files found. Check internet connection or CCKP bucket structure.")
+}
+
+cat("Number of RX5day files found:", length(test_keys), "\n")
+print(head(test_keys, 10))
+
+# ------------------------------------------------------------
+# 4. Find RX5day NetCDF files
+# ------------------------------------------------------------
+
+find_rx5day_file <- function(scenario) {
+  
+  keys <- test_keys
+  
+  selected <- keys %>%
+    str_subset(scenario) %>%
+    str_subset("rx5day") %>%
+    str_subset("\\.nc$")
+  
+  if (scenario == "historical") {
+    selected <- selected %>%
+      str_subset("historical")
+  }
+  
+  if (scenario != "historical") {
+    selected <- selected %>%
+      str_subset("2015|2100|2040|2059|annual|timeseries")
+  }
+  
+  # Prefer annual timeseries if available
+  annual_timeseries <- selected %>%
+    str_subset("annual") %>%
+    str_subset("timeseries")
+  
+  if (length(annual_timeseries) > 0) {
+    selected <- annual_timeseries
+  }
+  
+  # Prefer ensemble median if available
+  median_file <- selected[str_detect(selected, "median")]
+  
+  if (length(median_file) > 0) {
+    selected <- median_file[1]
+  } else {
+    selected <- selected[1]
+  }
+  
+  if (length(selected) == 0 || is.na(selected)) {
+    stop(paste("No RX5day file found for scenario:", scenario))
+  }
+  
+  selected
+}
+
+rx5day_keys <- map_chr(scenarios, find_rx5day_file)
+
+files_table <- tibble(
+  scenario = scenarios,
+  s3_key = rx5day_keys,
+  url = paste0(bucket_url, "/", s3_key),
+  local_file = file.path(
+    "data_raw/cckp_rx5day",
+    basename(rx5day_keys)
+  )
+)
+
+print(files_table)
+
+write_csv(
+  files_table,
+  "data_processed/cckp_rx5day_files_used.csv"
+)
+
+# ------------------------------------------------------------
+# 5. Download NetCDF files automatically
+# ------------------------------------------------------------
+
+download_one <- function(url, destfile) {
+  
+  if (!file.exists(destfile)) {
+    message("Downloading: ", basename(destfile))
+    download.file(
+      url,
+      destfile,
+      mode = "wb",
+      quiet = FALSE
+    )
+  } else {
+    message("Already downloaded: ", basename(destfile))
+  }
+}
+
+walk2(
+  files_table$url,
+  files_table$local_file,
+  download_one
+)
+
+# ------------------------------------------------------------
+# 6. Create spatial points from assets_unique
+# ------------------------------------------------------------
+
+pts <- vect(
+  assets_unique,
+  geom = c("Longitude", "Latitude"),
+  crs = "EPSG:4326"
+)
+
+# ------------------------------------------------------------
+# 7. Function to extract RX5day
+# ------------------------------------------------------------
+
+extract_rx5day <- function(nc_file, scenario_name, points_df, points_vect) {
+  
+  message("Extracting scenario: ", scenario_name)
+  
+  r <- rast(nc_file)
+  
+  # Try to recover years from raster time dimension
+  raster_time <- try(time(r), silent = TRUE)
+  
+  if (!inherits(raster_time, "try-error") &&
+      !all(is.na(raster_time))) {
+    
+    years <- as.numeric(format(raster_time, "%Y"))
+    
+  } else {
+    
+    layer_names <- names(r)
+    years <- as.numeric(str_extract(layer_names, "\\d{4}"))
+  }
+  
+  keep_layers <- which(years %in% years_keep)
+  
+  if (length(keep_layers) == 0) {
+    warning(
+      paste(
+        "No matching years found for",
+        scenario_name,
+        "- keeping all layers."
+      )
+    )
+    keep_layers <- seq_len(nlyr(r))
+    years_selected <- years
+  } else {
+    years_selected <- years[keep_layers]
+  }
+  
+  r <- r[[keep_layers]]
+  
+  vals <- terra::extract(r, points_vect)
+  
+  vals <- vals %>%
+    select(-ID) %>%
+    mutate(asset_point_id = points_df$asset_point_id)
+  
+  names(vals)[names(vals) != "asset_point_id"] <- paste0(
+    "year_",
+    years_selected
+  )
+  
+  vals_long <- vals %>%
+    pivot_longer(
+      cols = starts_with("year_"),
+      names_to = "year",
+      values_to = "rx5day"
+    ) %>%
+    mutate(
+      year = as.numeric(str_remove(year, "year_")),
+      scenario = scenario_name
+    ) %>%
+    filter(year %in% years_keep)
+  
+  vals_long
+}
+
+# ------------------------------------------------------------
+# 8. Extract all scenarios
+# ------------------------------------------------------------
+
+rx5day_extracted <- pmap_dfr(
+  list(
+    nc_file = files_table$local_file,
+    scenario_name = files_table$scenario
+  ),
+  function(nc_file, scenario_name) {
+    extract_rx5day(
+      nc_file = nc_file,
+      scenario_name = scenario_name,
+      points_df = assets_unique,
+      points_vect = pts
+    )
+  }
+)
+
+# ------------------------------------------------------------
+# 9. Merge with asset metadata
+# ------------------------------------------------------------
+
+rx5day_asset_panel <- rx5day_extracted %>%
+  left_join(
+    assets_unique,
+    by = "asset_point_id"
+  ) %>%
+  select(
+    asset_point_id,
+    Longitude,
+    Latitude,
+    `Country/area`,
+    Type...9,
+    capacity_mw,
+    n_units,
+    scenario,
+    year,
+    rx5day
+  ) %>%
+  arrange(
+    asset_point_id,
+    scenario,
+    year
+  )
+
+write_csv(
+  rx5day_asset_panel,
+  "data_processed/rx5day_ENGIE_assets_until_2050.csv"
+)
+
+# ------------------------------------------------------------
+# 10. Baseline and relative exposure
+# ------------------------------------------------------------
+
+baseline <- rx5day_asset_panel %>%
+  filter(
+    scenario == "historical",
+    year >= 1995,
+    year <= 2014
+  ) %>%
+  group_by(asset_point_id) %>%
+  summarise(
+    rx5day_baseline_1995_2014 = mean(rx5day, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+rx5day_exposure <- rx5day_asset_panel %>%
+  left_join(
+    baseline,
+    by = "asset_point_id"
+  ) %>%
+  mutate(
+    rx5day_change_absolute =
+      rx5day - rx5day_baseline_1995_2014,
+    
+    rx5day_change_relative =
+      rx5day / rx5day_baseline_1995_2014 - 1
+  )
+
+write_csv(
+  rx5day_exposure,
+  "data_processed/rx5day_ENGIE_exposure_relative_to_1995_2014.csv"
+)
+
+# ------------------------------------------------------------
+# 11. Quick checks
+# ------------------------------------------------------------
+
+cat("Extraction completed.\n")
+cat("Rows in final panel:", nrow(rx5day_asset_panel), "\n")
+
+print(head(rx5day_asset_panel))
+print(head(rx5day_exposure))
+
+
+
+
+rx5day_asset_panel %>%
+  count(scenario)
+
+rx5day_asset_panel %>%
+  group_by(scenario) %>%
+  summarise(min_year = min(year), max_year = max(year))
+
+
+rx5day_asset_panel
+rx5day_exposure
+print(rx5day_exposure)
+
+
+
+
+library(dplyr)
+library(ggplot2)
+
+rx5day_sum <- rx5day_asset_panel %>%
+  group_by(scenario, year) %>%
+  summarise(
+    total_rx5day = sum(rx5day, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(rx5day_sum, aes(x = year, y = total_rx5day, color = scenario)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Sum of RX5day across ENGIE assets",
+    subtitle = "Historical and CMIP6 projections by scenario",
+    x = "Year",
+    y = "Sum of RX5day across assets",
+    color = "Scenario"
+  ) +
+  theme_minimal()
+
+
+
+r <- rast(files_table$local_file[2])
+
+time(r)[1:10]
+names(r)[1:10]
+
+
+
+
+
+library(dplyr)
+library(ggplot2)
+
+rx5day_weighted <- rx5day_asset_panel %>%
+  group_by(scenario, year) %>%
+  summarise(
+    weighted_rx5day = weighted.mean(rx5day, capacity_mw, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+hist_2014 <- rx5day_weighted %>%
+  filter(scenario == "historical", year == 2014) %>%
+  pull(weighted_rx5day)
+
+bridge <- tibble(
+  scenario = c("ssp126", "ssp245", "ssp370", "ssp585"),
+  year = 2014,
+  weighted_rx5day = hist_2014
+)
+
+rx5day_weighted_plot <- rx5day_weighted %>%
+  filter(year <= 2050) %>%
+  bind_rows(bridge) %>%
+  arrange(scenario, year)
+
+ggplot(rx5day_weighted_plot, aes(x = year, y = weighted_rx5day, color = scenario)) +
+  geom_line(linewidth = 1) +
+  labs(
+    title = "Capacity-weighted RX5day across ENGIE assets",
+    subtitle = "Historical and CMIP6 projections by scenario",
+    x = "Year",
+    y = "Capacity-weighted RX5day",
+    color = "Scenario"
+  ) +
+  theme_minimal()
+
+
+
+
+
+
+nc_plot <- rx5day_asset_panel %>%
+  filter(`Country/area` == "New Caledonia") %>%
+  group_by(scenario, year) %>%
+  summarise(
+    rx5day = mean(rx5day, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+hist_2014_nc <- nc_plot %>%
+  filter(scenario == "historical", year == 2014) %>%
+  pull(rx5day)
+
+bridge_nc <- tibble(
+  scenario = c("ssp126", "ssp245", "ssp370", "ssp585"),
+  year = 2014,
+  rx5day = hist_2014_nc
+)
+
+nc_plot_joined <- nc_plot %>%
+  filter(year >= 2000, year <= 2040) %>%
+  bind_rows(bridge_nc) %>%
+  arrange(scenario, year)
+
+ggplot(nc_plot_joined, aes(x = year, y = rx5day, color = scenario)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  geom_vline(xintercept = 2015, linetype = "dashed") +
+  labs(
+    title = "New Caledonia - RX5day projections from CCKP",
+    subtitle = "Historical and CMIP6 scenarios, 2010–2040",
+    x = "Year",
+    y = "RX5day",
+    color = "Scenario"
+  ) +
+  theme_minimal()
+
+
+
+
+
+
+
+country_trend <- rx5day_asset_panel %>%
+  filter(
+    (scenario == "historical" & year >= 2000 & year <= 2014) |
+      (scenario == "ssp245" & year >= 2040 & year <= 2050)
+  ) %>%
+  mutate(
+    period = ifelse(
+      scenario == "historical",
+      "historical",
+      "future"
+    )
+  ) %>%
+  group_by(`Country/area`, period) %>%
+  summarise(
+    rx5day = weighted.mean(rx5day, capacity_mw),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = period,
+    values_from = rx5day
+  ) %>%
+  mutate(
+    delta = future - historical
+  ) %>%
+  arrange(desc(delta))
+
+
+head(country_trend,20)
+
+
+country_contribution <- rx5day_asset_panel %>%
+  filter(
+    (scenario == "historical" & year >= 2000 & year <= 2014) |
+      (scenario == "ssp245" & year >= 2040 & year <= 2050)
+  ) %>%
+  mutate(
+    period = ifelse(scenario == "historical",
+                    "historical",
+                    "future")
+  ) %>%
+  group_by(`Country/area`, period) %>%
+  summarise(
+    rx = weighted.mean(rx5day, capacity_mw),
+    capacity = sum(capacity_mw),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = period,
+    values_from = c(rx, capacity)
+  ) %>%
+  mutate(
+    delta = rx_future - rx_historical,
+    contribution = delta * capacity_future
+  ) %>%
+  arrange(desc(contribution))
+
+country_contribution %>%
+  select(`Country/area`,
+         delta,
+         capacity_future,
+         contribution) %>%
+  head(20)
+
+
+
+
+library(dplyr)
+library(ggplot2)
+
+plot_data <- country_contribution %>%
+  select(`Country/area`, contribution) %>%
+  slice_max(contribution, n = 15) %>%
+  arrange(contribution)
+
+ggplot(
+  plot_data,
+  aes(
+    x = reorder(`Country/area`, contribution),
+    y = contribution
+  )
+) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Main contributors to the increase in RX5day exposure",
+    subtitle = "Difference between historical period (2000–2014) and SSP2-4.5 (2040–2050)",
+    x = "",
+    y = "Contribution to aggregate RX5day increase"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+
+
+
+library(dplyr)
+library(ggplot2)
+
+# Data: capacity-weighted RX5day
+rx5day_weighted <- rx5day_asset_panel %>%
+  group_by(scenario, year) %>%
+  summarise(
+    rx5day = weighted.mean(rx5day, capacity_mw, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Add 2014 historical value to visually connect scenarios
+hist_2014 <- rx5day_weighted %>%
+  filter(scenario == "historical", year == 2014) %>%
+  pull(rx5day)
+
+bridge <- tibble(
+  scenario = c("ssp126", "ssp245", "ssp370", "ssp585"),
+  year = 2014,
+  rx5day = hist_2014
+)
+
+rx5day_weighted_plot <- rx5day_weighted %>%
+  filter(year >= 2000, year <= 2050) %>%
+  bind_rows(bridge) %>%
+  arrange(scenario, year)
+
+ggplot(
+  rx5day_weighted_plot,
+  aes(x = year, y = rx5day, color = scenario)
+) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.4) +
+  geom_vline(xintercept = 2015, linetype = "dashed", color = "black") +
+  labs(
+    title = "ENGIE portfolio - capacity-weighted RX5day projections",
+    subtitle = "Historical and CMIP6 scenarios, 2010–2050",
+    x = "Year",
+    y = "Capacity-weighted RX5day (mm)",
+    color = "Scenario"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "right"
+  )
+
+
+
+library(dplyr)
+
+# 1. Définir mu(g) à partir du changement relatif de RX5day
+# Ici, mu(g) augmente avec l'exposition géographique
+alpha_mu <- 1
+
+stress_data <- rx5day_exposure %>%
+  mutate(
+    g = rx5day_change_relative,
+    mu_g = alpha_mu * g
+  )
+
+
+sector_sigma <- tibble(
+  Type...9 = c("coal", "oil/gas", "bioenergy"),
+  sigma_s = c(0.30, 0.20, 0.15)
+)
+
+stress_data <- stress_data %>%
+  left_join(sector_sigma, by = "Type...9")
+
+
+
+set.seed(123)
+
+S0 <- 1
+
+stress_data <- stress_data %>%
+  mutate(
+    t = year - 2015,
+    t = ifelse(t < 0, 0, t),
+    W_t = rnorm(n(), mean = 0, sd = sqrt(pmax(t, 0))),
+    
+    ST = S0 * exp(
+      (mu_g - 0.5 * sigma_s^2) * t +
+        sigma_s * W_t
+    )
+  )
+
+
+stress_curve <- stress_data %>%
+  filter(year >= 2015, year <= 2050) %>%
+  group_by(scenario, year) %>%
+  summarise(
+    ST_weighted = weighted.mean(ST, capacity_mw, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+library(ggplot2)
+
+ggplot(stress_curve, aes(x = year, y = ST_weighted, color = scenario)) +
+  geom_line(linewidth = 1.1) +
+  geom_point(size = 1.3) +
+  labs(
+    title = "Climate stress trajectory across ENGIE assets",
+    subtitle = "Stress process based on RX5day exposure and sectoral volatility",
+    x = "Year",
+    y = "Capacity-weighted stress level ST(t)",
+    color = "Scenario"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+
+
+
+
+# ============================================================
+# STOCHASTIC CLIMATE STRESS TEST WITH SECTORAL NOISE
+# Median trajectory + uncertainty band
+# ============================================================
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(purrr)
+
+sector_sigma <- tibble(
+  Type...9 = c("coal", "oil/gas", "bioenergy"),
+  sigma_s = c(0.30, 0.20, 0.15)
+)
+
+alpha_mu <- 0.05
+n_sim <- 500
+
+set.seed(123)
+
+stress_base <- rx5day_exposure %>%
+  filter(year >= 2015, year <= 2050) %>%
+  left_join(sector_sigma, by = "Type...9") %>%
+  mutate(
+    g = log(rx5day / rx5day_baseline_1995_2014),
+    mu_g = alpha_mu * g,
+    t = year - 2015
+  )
+
+simulate_stress <- function(sim_id) {
+  
+  stress_base %>%
+    mutate(
+      sim = sim_id,
+      W_t = rnorm(n(), mean = 0, sd = sqrt(pmax(t, 0))),
+      ST = exp(
+        (mu_g - 0.5 * sigma_s^2) * t +
+          sigma_s * W_t
+      )
+    )
+}
+
+stress_simulations <- map_dfr(1:n_sim, simulate_stress)
+
+stress_summary <- stress_simulations %>%
+  group_by(scenario, year, sim) %>%
+  summarise(
+    ST_weighted = weighted.mean(ST, capacity_mw, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(scenario, year) %>%
+  summarise(
+    ST_median = median(ST_weighted, na.rm = TRUE),
+    ST_p05 = quantile(ST_weighted, 0.05, na.rm = TRUE),
+    ST_p95 = quantile(ST_weighted, 0.95, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(stress_summary, aes(x = year, color = scenario, fill = scenario)) +
+  geom_ribbon(
+    aes(ymin = ST_p05, ymax = ST_p95),
+    alpha = 0.15,
+    color = NA
+  ) +
+  geom_line(
+    aes(y = ST_median),
+    linewidth = 1.1
+  ) +
+  labs(
+    title = "Stochastic climate stress trajectories across ENGIE assets",
+    subtitle = "Median and 5–95% interval from sectoral Brownian volatility",
+    x = "Year",
+    y = "Capacity-weighted ST(t)",
+    color = "Scenario",
+    fill = "Scenario"
+  ) +
+  theme_minimal(base_size = 14)
+
+write.csv(
+  stress_summary,
+  "data_processed/stochastic_stress_summary_sectoral_noise.csv",
+  row.names = FALSE
+)
+
+ggsave(
+  "data_processed/stochastic_stress_summary_sectoral_noise.png",
+  width = 11,
+  height = 6,
+  dpi = 300
+)
+
