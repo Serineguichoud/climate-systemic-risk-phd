@@ -1,1 +1,84 @@
+library(dplyr)
+library(stringr)
+library(leaflet)
+library(htmltools)
+library(RColorBrewer)
+
+Geo_clean <- Geo %>%
+  mutate(
+    Latitude = as.numeric(str_replace(as.character(Latitude), ",", ".")),
+    Longitude = as.numeric(str_replace(as.character(Longitude), ",", ".")),
+    Capacity_MW = as.numeric(str_replace(as.character(`Capacity (MW)`), ",", ".")),
+    Type = as.factor(Type)
+  ) %>%
+  filter(
+    !is.na(Latitude),
+    !is.na(Longitude),
+    !is.na(Capacity_MW),
+    !is.na(Type),
+    Status == "operating"
+  )
+
+# Palette des secteurs
+pal <- colorFactor(
+  palette = "Set1",
+  domain = Geo_clean$Type
+)
+
+# Légende taille
+legend_size <- HTML("
+<div style='background:white;
+            padding:10px;
+            border-radius:5px;
+            border:1px solid grey;'>
+
+<b>Capacity (MW)</b><br>
+
+<span style='font-size:8px;'>●</span> 0 - 100 MW<br>
+
+<span style='font-size:12px;'>●</span> 100 - 500 MW<br>
+
+<span style='font-size:18px;'>●</span> 500 - 1000 MW<br>
+
+<span style='font-size:24px;'>●</span> > 1000 MW
+
+</div>
+")
+
+leaflet(Geo_clean) %>%
+  addTiles() %>%
+  
+  addCircleMarkers(
+    lng = ~Longitude,
+    lat = ~Latitude,
+    
+    radius = ~pmax(3, sqrt(Capacity_MW)/2),
+    
+    color = ~pal(Type),
+    fillColor = ~pal(Type),
+    
+    fillOpacity = 0.7,
+    stroke = TRUE,
+    weight = 1,
+    
+    popup = ~paste0(
+      "<b>Parent:</b> ", `Parent(s)`,
+      "<br><b>Sector:</b> ", Type,
+      "<br><b>Status:</b> ", Status,
+      "<br><b>Capacity:</b> ", round(Capacity_MW,0), " MW"
+    )
+  ) %>%
+  
+  addLegend(
+    position = "bottomright",
+    pal = pal,
+    values = ~Type,
+    title = "Sector",
+    opacity = 0.8
+  ) %>%
+  
+  addControl(
+    legend_size,
+    position = "bottomleft"
+  )
 
