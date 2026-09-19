@@ -155,3 +155,13 @@ Serine Guichoud
 PhD Thesis
 
 *Systemic Risk of Extreme Climate Events and Contagion of Economic Impacts*
+
+---
+
+## License
+
+Copyright © 2026 Serine Guichoud. All rights reserved.
+
+The code is made publicly available for academic transparency and
+reproducibility. Redistribution, modification, or commercial use requires
+prior written permission from the author.
